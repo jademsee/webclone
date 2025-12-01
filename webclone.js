@@ -63,8 +63,6 @@
 //   - Alternative Method: Use `capture-cookies.js` to paste cookie data
 //     exported from your browser using a standard browser extension.
 //
-// See MANUAL_COOKIE_EXPORT.md for instructions on exporting cookies without
-// a third-party extension.
 
 const fs = require("fs");
 const os = require("os");
