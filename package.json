@@ -1,0 +1,19 @@
+{
+  "name": "webclone",
+  "version": "1.0.0",
+  "description": "`webclone.js` is a Node.js script designed to archive websites and download videos.",
+  "main": "webclone.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "pino": "^10.1.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "yargs": "^18.0.0"
+  }
+}
