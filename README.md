@@ -5,6 +5,10 @@
 
 WebClone.js is a lean, asynchronous, and powerful command-line tool for creating complete, offline archives of websites. It crawls a site, saves all pages and assets (CSS, JS, images), rewrites links for local viewing, and can even detect and download videos from popular streaming platforms.
 
+## 💡 Motivation
+
+This project was born out of a specific need to archive comprehensive documentation from a dynamic website. Traditional tools like `wget` proved insufficient for handling modern web complexities, often failing to download all assets or correctly rewrite internal links. With the assistance of Gemini, this tool was developed to address those challenges, providing a more robust and intelligent solution for offline website and video archiving.
+
 ## ✨ Features
 
 -   **Full Website Archiving**: Creates a fully self-contained offline copy of a website.
