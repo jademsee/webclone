@@ -1,95 +1,123 @@
-# WebClone.js - Website and Video Archiver
+# 🌐 WebClone.js - A Robust Website and Video Archiver
 
-`webclone.js` is a Node.js script designed to archive websites and download videos.
+![Node.js](https://img.shields.io/badge/Node.js-v18%2B-green?style=for-the-badge&logo=node.js)
+![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)
 
-## Core Functionality
+WebClone.js is a lean, asynchronous, and powerful command-line tool for creating complete, offline archives of websites. It crawls a site, saves all pages and assets (CSS, JS, images), rewrites links for local viewing, and can even detect and download videos from popular streaming platforms.
 
-*   **Website Archiving:**
-    *   Crawls websites starting from a given URL.
-    *   Saves all pages and assets (CSS, JS, images, etc.).
-    *   Rewrites all links to relative paths, creating a self-contained offline archive.
-*   **Video Archiving:**
-    *   Intelligently detects and downloads videos from popular streaming sites (e.g., YouTube, Vimeo, Dailymotion, TikTok, Facebook Reels, Bilibili) using `yt-dlp`.
-    *   Rewrites embedded video links to point to local files.
+## ✨ Features
 
-## Prerequisites
+-   **Full Website Archiving**: Creates a fully self-contained offline copy of a website.
+-   **Link Rewriting**: Intelligently rewrites all links (`<a>`, `<img>`, `<script>`, `<link>`, CSS `url()`, etc.) to relative paths for seamless offline browsing.
+-   **Video Downloading**: Automatically detects and downloads videos from YouTube, Vimeo, TikTok, and other popular sites using `yt-dlp`.
+-   **Authentication Support**: Archive content behind logins using session cookies.
+    -   **Interactive Login**: Opens a browser for you to log in manually before starting the crawl.
+    -   **Cookie File**: Use a `cookies.json` file exported from your browser.
+-   **Highly Configurable**: Control every aspect of the crawl, including depth, concurrency, crawl scope (same-domain, subdomains), timeouts, and more.
+-   **Stealth & Robustness**: Uses `puppeteer-extra` with a stealth plugin to avoid bot detection and includes built-in retries and rate-limiting cool-downs.
+-   **Lazy-Loading Support**: Automatically scrolls pages to trigger and capture lazy-loaded content.
 
-*   Node.js (v18 or higher recommended).
-*   Run `npm install` to install project dependencies.
-*   For video downloading: `yt-dlp` and `ffmpeg` must be installed and available in your system's PATH.
+---
+
+## ⚙️ Prerequisites
+
+1.  **Node.js**: Version 18 or higher is recommended.
+2.  **yt-dlp (Optional)**: Required for downloading videos. Must be installed and accessible in your system's `PATH`.
+3.  **ffmpeg (Optional)**: Required by `yt-dlp` for merging high-quality video and audio streams.
+
+---
+
+## 🚀 Installation & Setup
+
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/jademsee/webclone.git
+    cd webclone
+    ```
+
+2.  **Install Node.js dependencies:**
+    ```bash
+    npm install
+    ```
+
+---
 
 ## Usage
 
-The script is executed from the command line:
+The script is run from the command line with a starting URL.
 
 ```bash
-node webclone.js [options] <start_url_1> [start_url_2] ...
+node webclone.js [options] <start_url>
 ```
 
-To see a full list of options, run:
+### Examples
+
+**1. Basic Website Archive**
+Archive a single public website.
+
+```bash
+node webclone.js https://www.example.com/
+```
+
+**2. Archive a Private Site (Login Required)**
+Use the interactive login feature to authenticate, then save your session for future use.
+
+```bash
+# First time, log in and save your session
+node webclone.js --interactive-login --save-cookies ./my-session.json https://private.example.com/dashboard
+
+# Subsequent runs, use the saved session
+node webclone.js --cookies ./my-session.json https://private.example.com/dashboard
+```
+
+**3. Download a Standalone Video**
+The script will detect the video URL and download it.
+
+```bash
+node webclone.js https://www.youtube.com/watch?v=dQw4w9WgXcQ
+```
+
+**4. Archive a Page and Its Embedded Videos**
+Crawl an article and automatically download any embedded videos, rewriting the links to point to the local files.
+
+```bash
+node webclone.js https://my-blog.com/interesting-article
+```
+
+**5. Limit Crawl Scope and Depth**
+Archive only pages on the same domain as the starting URL, going only one level deep.
+
+```bash
+node webclone.js --crawl-scope same-domain --max-depth 1 https://www.example.com/
+```
+
+**6. Full Help Menu**
+For a complete list of all available options, run:
+
 ```bash
 node webclone.js --help
 ```
 
-## Key Features & Configuration Options
+---
 
-The script's behavior can be customized with the following command-line arguments:
+## 🛠️ Key Configuration Options
 
-*   `--cookies <path>`: Path to a JSON file containing browser cookies for authenticating with private sites.
-*   `--interactive-login`: Opens a browser for you to log in manually before the crawl begins.
-*   `--save-cookies <path>`: Specifies a path to save cookies after a successful interactive login.
-*   `--out-dir <path>`: The root directory where the archive will be saved (default: `./archive`).
-*   `--max-depth <num>`: Sets the maximum crawl depth (0 for start URLs only, default: 5).
-*   `--max-pages <num>`: Sets the maximum number of pages to crawl (default: 600).
-*   `--concurrency <num>`: The number of concurrent workers (browser pages) to use (default: 3).
-*   `--max-consecutive-failures <num>`: The maximum number of consecutive page failures before stopping the crawl (default: 10).
-*   `--user-agent <string>`: The User-Agent string to use for requests.
-*   `--save-failed-responses`: If true, saves responses that failed (e.g., with 404 or 500 status codes).
-*   `--rewrite-css`: Enables or disables the rewriting of CSS `url()` paths (default: true).
-*   `--follow-iframes`: If true, the crawler will crawl content inside iframes (default: true).
-*   `--protocol-timeout <ms>`: The Puppeteer protocol timeout in milliseconds (default: 90000).
-*   `--videos <mode>`: Sets the video download mode. Options are `"auto"`, `"all"`, or `"none"` (default: `"auto"`).
-*   `--video-resolution <height>`: The maximum desired video height (e.g., 1080, 720).
-*   `--yt-dlp-path <path>`: A specific path to the `yt-dlp` executable.
-*   `--crawl-scope <scope>`: Defines the scope of the crawl. Options are `"same-domain"`, `"subdomains"`, `"cross-domains"` (default: `"cross-domains"`).
-*   `--global-timeout <minutes>`: Sets the maximum total crawl time in minutes (0 for no limit).
-*   `--stall-timeout <minutes>`: The number of minutes without a successful page crawl before stopping (0 for no limit).
-*   `--asset-timeout <seconds>`: The number of seconds to wait for an asset to buffer before timing out (default: 30).
-*   `--show-browser`: Runs the browser in a visible window for debugging purposes.
-*   `--log-level <level>`: Sets the logging level. Options are `debug`, `info`, `warn`, `error`, `fatal`.
+-   `--cookies <path>`: Path to a `cookies.json` file.
+-   `--out-dir <path>`: The directory to save the archive (default: `./archive`).
+-   `--max-depth <num>`: Maximum crawl depth (default: 5).
+-   `--concurrency <num>`: Number of concurrent browser pages to use (default: 3).
+-   `--videos <mode>`: Video download mode: `auto`, `all`, or `none` (default: `auto`).
+-   `--video-resolution <height>`: Maximum video height (e.g., `720`).
+-   `--crawl-scope <scope>`: Crawl scope: `same-domain`, `subdomains`, `cross-domains` (default: `cross-domains`).
+-   `--show-browser`: Run the browser in a visible window for debugging.
+-   `--log-level <level>`: Set the logging level (`debug`, `info`, `warn`, `error`).
 
-## Dependencies
+---
 
-*   **Node.js Built-ins:** `fs`, `os`, `path`, `crypto`, `child_process`, `timers/promises`, `stream/promises`, `readline`
-*   **cheerio**: For HTML parsing and manipulation.
-*   **puppeteer-extra** & **puppeteer-extra-plugin-stealth**: For browser automation with stealth capabilities.
-*   **pino**: For logging.
-*   **yargs**: For parsing command-line arguments.
+## 🤝 Contributing
 
-## Internal Architecture & State (`CRAWL_STATE`)
+Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/jademsee/webclone/issues).
 
-The script maintains a global state object (`CRAWL_STATE`) to manage the crawl process:
+## 📄 License
 
-*   **Queue-based crawling:** `CRAWL_STATE.queue` holds the list of URLs to be crawled.
-*   **Uniqueness Sets:** `CRAWL_STATE.enqueued` and `CRAWL_STATE.visited` track URLs to prevent redundant processing.
-*   **Records:** `CRAWL_STATE.records` stores metadata (file path, content type, status) for every URL encountered, which is crucial for link rewriting.
-*   **Rate-limiting:** `CRAWL_STATE.coolDownUntil` implements a global pause for all workers to respect `Retry-After` headers from servers.
-*   **Statistics:** `CRAWL_STATE.stats` tracks various metrics like pages crawled, assets saved, and total bytes.
-*   **Scope Control:** `CRAWL_STATE.initialHosts` and `CRAWL_STATE.initialBaseDomains` are used to enforce the boundaries of the crawl based on the configuration.
-*   **Video State:** `CRAWL_STATE.processedVideos`, `CRAWL_STATE.videoUrlMap`, and `CRAWL_STATE.activeVideoDownloads` are used to manage the state of video downloads.
-
-## Key Functions & Logic
-
-*   `main()`: The primary function that initializes the crawl, handles the interactive login flow, launches the browser workers, and monitors the overall progress.
-*   `worker()`: Pulls URLs from the queue and passes them to `crawlPage` for processing.
-*   `crawlPage()`: Navigates to a page, discovers all links and assets, handles network responses, and orchestrates the archiving process.
-*   `archivePageAndAssets()`: Coordinates the in-memory rewriting of HTML and CSS and saves all content to disk.
-*   `rewriteHtml()`: Rewrites URLs found within HTML attributes and inline styles to point to their local, archived versions.
-*   `rewriteCssUrls()`: Rewrites `url()` and `@import` paths within CSS content.
-*   `downloadVideo()`: Manages video downloads by spawning `yt-dlp`, including retry logic and cookie handling.
-*   `urlToFilePath()`: Converts a URL into a local file path, handling potential issues like path length limits and query parameters.
-*   `setupResponseListener()`: Listens for all network responses from the browser to capture assets and recursively discover URLs within CSS files.
-*   `handleEvictedAsset()`: Provides a robust fallback mechanism to re-fetch assets that may have been evicted from the browser's cache.
-*   `autoScroll()`: Automatically scrolls the page to the bottom to trigger and load any lazy-loaded content.
-*   **Helper Functions:** Includes various helpers for URL normalization (`normalizeUrl`), domain extraction (`getBaseDomain`), file extension inference (`inferExtension`), file system operations (`sanitizeSegment`), and data hashing (`hash`).
-*   The script includes graceful shutdown handlers for `SIGINT` and `SIGTERM` to ensure a clean exit.
+This project is licensed under the MIT License.
