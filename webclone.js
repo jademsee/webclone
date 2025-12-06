@@ -342,6 +342,7 @@ const CRAWL_STATE = {
   videoUrlMap: new Map(),
   activeVideoDownloads: 0,
   activeDownloadProcesses: new Set(),
+  ytDlpNeeded: false,
 };
 /* ---------------------------------------------------- */
 
@@ -511,19 +512,7 @@ async function main() {
   }, "Crawl scope initialized.");
   // --- End Scope ---
 
-  if (CONFIG.videos !== 'none') {
-    // Sanity check for yt-dlp
-    try {
-      await new Promise((resolve, reject) => {
-        const check = spawn(CONFIG.ytDlpPath, ['--version']);
-        check.on('error', reject);
-        check.on('close', code => code === 0 ? resolve() : reject(new Error(`yt-dlp version check failed with code ${code}`)));
-      });
-    } catch (e) {
-      logger.fatal(`Failed to execute '${CONFIG.ytDlpPath}'. Please ensure yt-dlp is installed and accessible in your PATH, or specify its location with --yt-dlp-path.`);
-      process.exit(1);
-    }
-  }
+
 
   let cookies = [];
 
@@ -588,10 +577,14 @@ async function main() {
   }
 
   const initialVideoPromises = [];
+  if (CONFIG.videos === 'all') {
+    CRAWL_STATE.ytDlpNeeded = true;
+  }
   for (const startUrl of CONFIG.startUrls) {
     const shouldDownloadVideo = (CONFIG.videos === 'all') || (CONFIG.videos === 'auto' && isDirectVideoUrl(startUrl));
 
     if (shouldDownloadVideo) {
+      CRAWL_STATE.ytDlpNeeded = true;
       if (!CRAWL_STATE.processedVideos.has(startUrl)) {
         CRAWL_STATE.processedVideos.add(startUrl);
         CRAWL_STATE.activeVideoDownloads++;
@@ -613,6 +606,20 @@ async function main() {
   }
 
   // --- Execution Path Decision ---
+
+  if (CRAWL_STATE.ytDlpNeeded) {
+    // Sanity check for yt-dlp only if it's potentially needed.
+    try {
+      await new Promise((resolve, reject) => {
+        const check = spawn(CONFIG.ytDlpPath, ['--version']);
+        check.on('error', reject);
+        check.on('close', code => code === 0 ? resolve() : reject(new Error(`yt-dlp version check failed with code ${code}`)));
+      });
+    } catch (e) {
+      logger.fatal(`Failed to execute '${CONFIG.ytDlpPath}'. Please ensure yt-dlp is installed and accessible in your PATH, or specify its location with --yt-dlp-path.`);
+      process.exit(1);
+    }
+  }
   // If there are no pages to crawl (only initial videos), we can use a simpler, faster path.
   if (CRAWL_STATE.queue.length === 0) {
     logger.info("No pages to crawl. Running in video-only download mode.");
@@ -664,10 +671,10 @@ async function main() {
       await performShutdown("Stall Timeout", 1);
     }
     // Completion Check: The normal exit condition for a successful crawl.
-    else if (CRAWL_STATE.queue.length === 0 && CRAWL_STATE.stats.activeWorkers === 0) {
+    else if (CRAWL_STATE.queue.length === 0 && CRAWL_STATE.stats.activeWorkers === 0 && CRAWL_STATE.activeVideoDownloads === 0) {
       logger.info("Queue is empty and all workers are idle. Crawl is complete.");
       // This signals a graceful shutdown. The main `finally` block will call performShutdown.
-      await performShutdown("Crawl Complete", 0);
+      CRAWL_STATE.shuttingDown = true;
     }
   }, 5000); // Check every 5 seconds
 
@@ -1200,7 +1207,7 @@ function urlToFilePath(rootDir, url, contentType, isPageHtml, forceExt = "") {
  * @param {Function} setError - A callback to signal an error to the parent crawlPage function.
  * @returns {Function} The event handler function that was attached.
  */
-function setupResponseListener(page, responsePromises, depth, setError, cssRegexes, recursivelyDiscoveredUrls, cookies) {
+async function setupResponseListener(page, responsePromises, depth, setError, cssRegexes, recursivelyDiscoveredUrls, cookies) {
   const responseHandler = (response) => {
     const responseUrl = normalizeUrl(response.url());
     if (!responseUrl || responsePromises.has(responseUrl) || CRAWL_STATE.shuttingDown) {
@@ -1300,7 +1307,7 @@ async function discoverLinksAndAssets(page, cssRegexes) {
         let match;
         regex.lastIndex = 0;
         while ((match = regex.exec(cssText)) !== null) {
-          const url = match[2] || match[4] || match[6];
+          const url = match[2] || match[4];
           if (url) add(url, baseUrl);
         }
       }
@@ -1540,113 +1547,109 @@ async function downloadVideo(videoUrl, refererUrl = null, cookies = []) {
  * Attempts a single video download using yt-dlp. This function is wrapped by the main downloadVideo function which contains the retry logic.
  * @param {string} videoUrl - The URL of the video to download.
  * @param {string|null} refererUrl - The referer URL.
- * @param {Array} cookies - An array of cookie objects.
  * @returns {Promise<string>} A promise that resolves with the local file path.
  */
 function attemptSingleDownload(videoUrl, refererUrl = null, cookies = []) {
-  return new Promise(async (resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const videoHost = new URL(videoUrl).hostname.replace('www.', '');
     const outDir = path.join(CONFIG.outDir, videoHost);
     const outputPathTemplate = path.join(outDir, '%(title)s.%(ext)s');
 
-    let tempCookiePath = null;
-    let cookiePathToUse = CONFIG.cookiePath;
+    const args = [
+      videoUrl,
+      '--no-playlist',
+      '-o', outputPathTemplate,
+    ];
 
-    try {
-      // If we don't have a cookie file path but we DO have cookies from a live session,
-      // we need to create a temporary cookie file for yt-dlp.
-      if (!cookiePathToUse && cookies.length > 0) {
-        tempCookiePath = path.join(os.tmpdir(), `webclone-cookies-${crypto.randomBytes(6).toString('hex')}.txt`);
-
-        // Convert Puppeteer cookies to Netscape cookie format for yt-dlp.
-        const netscapeCookies = cookies.map(c => {
-          const domain = c.domain.startsWith('.') ? c.domain : `.${c.domain}`;
-          const includeSubdomains = 'TRUE';
-          const secure = c.secure ? 'TRUE' : 'FALSE';
-          const expires = c.session ? '0' : String(Math.round(c.expires));
-          return [domain, includeSubdomains, c.path, secure, expires, c.name, c.value].join('\t');
-        }).join('\n');
-
-        await fs.promises.writeFile(tempCookiePath, netscapeCookies);
-        cookiePathToUse = tempCookiePath;
-        logger.debug({ path: tempCookiePath }, "Created temporary cookie file for yt-dlp.");
-      }
-
-      const args = [
-        videoUrl,
-        '--no-playlist',
-        '-o', outputPathTemplate,
-        '--print', 'filename',
-        '--verbose',
-      ];
-
-      if (cookiePathToUse) {
-        args.push('--cookies', cookiePathToUse);
-      }
-
-      const referer = refererUrl || new URL(videoUrl).origin;
-      args.push('--referer', referer);
-      args.push('--user-agent', CONFIG.userAgent);
-
-      let formatString;
-      if (CONFIG.videoResolution) {
-        const H = CONFIG.videoResolution;
-        const p1 = `best[height<=${H}][ext=mp4]`; // Priority 1
-        const p2 = `best[height<=${H}]`; // Priority 2
-        const p3 = `worstvideo[height>${H}]+bestaudio`; // Priority 3
-        const p4 = `bestvideo+bestaudio/best`; // Priority 4
-        formatString = `${p1}/${p2}/${p3}/${p4}`;
-      } else {
-        formatString = 'best[ext=mp4]/best/bestvideo+bestaudio';
-      }
-      args.push('-f', formatString);
-
-      logger.info({ url: videoUrl, args: args.map(a => a.includes(' ') ? `"${a}"` : a).join(' ') }, 'Spawning yt-dlp process...');
-
-      const ytDlp = spawn(CONFIG.ytDlpPath, args, {
-        detached: true,
-        stdio: ['ignore', 'pipe', 'pipe']
-      });
-
-      CRAWL_STATE.activeDownloadProcesses.add(ytDlp);
-      let stdoutData = '';
-      let stderrData = '';
-
-      ytDlp.stdout.on('data', (data) => { stdoutData += data.toString(); });
-      ytDlp.stderr.on('data', (data) => { stderrData += data.toString(); });
-
-      ytDlp.on('close', (code) => {
-        CRAWL_STATE.activeDownloadProcesses.delete(ytDlp);
-        
-        // Always log full stdout and stderr for debugging
-        if (stdoutData) logger.debug({ url: videoUrl, stdout: stdoutData.trim() }, "yt-dlp stdout:");
-        if (stderrData) logger.debug({ url: videoUrl, stderr: stderrData.trim() }, "yt-dlp stderr:");
-
-        if (code === 0) {
-          const finalPath = stdoutData.trim();
-          if (finalPath) {
-            logger.info({ url: videoUrl, path: finalPath }, 'Video download complete.');
-            resolve(finalPath);
-          } else {
-            reject(new Error(`yt-dlp exited successfully but did not print a filename. Stderr: ${stderrData}`));
-          }
-        } else {
-          const errorMsg = `yt-dlp process exited with code ${code}. Stderr: ${stderrData}`;
-          reject(new Error(errorMsg));
-        }
-      });
-
-      ytDlp.on('error', (err) => {
-        reject(new Error(`Failed to start yt-dlp process: ${err.message}`));
-      });
-
-    } catch (err) {
-      reject(err);
-    } finally {
-      // if (tempCookiePath) {
-      //   await fs.promises.unlink(tempCookiePath).catch(e => logger.warn({ err: e.message }, `Failed to delete temp cookie file: ${tempCookiePath}`));
-      // }
+    if (CONFIG.cookiePath) {
+      args.push('--cookies', CONFIG.cookiePath);
     }
+
+    const referer = refererUrl || new URL(videoUrl).origin;
+    args.push('--referer', referer);
+    args.push('--user-agent', CONFIG.userAgent);
+
+    let formatString;
+    if (CONFIG.videoResolution) {
+      const H = CONFIG.videoResolution;
+      const p1 = `best[height<=${H}][ext=mp4]`; // Priority 1: Ideal pre-merged MP4.
+      const p2 = `best[height<=${H}]`; // Priority 2: Any pre-merged format at target res.
+      const p3 = `worstvideo[height>${H}]+bestaudio`; // Priority 3: Next-highest resolution, merged.
+      const p4 = `bestvideo+bestaudio/best`; // Priority 4: Absolute best, merged.
+      formatString = `${p1}/${p2}/${p3}/${p4}`;
+    } else {
+      // Default if no resolution is specified: try pre-merged mp4, then any pre-merged, then merge the best.
+      formatString = 'best[ext=mp4]/best/bestvideo+bestaudio';
+    }
+    args.push('-f', formatString);
+
+    logger.info({ url: videoUrl, args }, 'Spawning yt-dlp process...');
+
+    const ytDlp = spawn(CONFIG.ytDlpPath, args, {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    CRAWL_STATE.activeDownloadProcesses.add(ytDlp);
+    let stdoutData = '';
+    let stderrData = '';
+
+    ytDlp.stdout.on('data', (data) => {
+      stdoutData += data.toString();
+    });
+
+    ytDlp.stderr.on('data', (data) => {
+      stderrData += data.toString();
+    });
+
+    ytDlp.on('close', (code) => {
+      CRAWL_STATE.activeDownloadProcesses.delete(ytDlp);
+
+      if (code === 0) {
+        let finalPath = null;
+        let match = stdoutData.match(/\[download\] Destination: (.*)/) || stdoutData.match(/\[download\] (.*) has already been downloaded/);
+        if (match && match[1]) {
+          finalPath = match[1].trim();
+        }
+
+        if (finalPath) {
+          logger.info({ url: videoUrl, path: finalPath }, 'Video download complete.');
+          resolve(finalPath);
+        } else {
+          // This can happen if the video was already downloaded in a previous run.
+          // yt-dlp exits 0 but doesn't print the "Destination" line.
+          // We need to find the file manually in this case.
+          const videoTitleRegex = /\[info\] (?:(?:NA|Downloading)\s+page|Extracting\s+data|Resolving\s+extractor|Downloading\s+m3u8)\s+for\s+"([^"]+)"/;
+          const titleMatch = stdoutData.match(videoTitleRegex);
+          const videoTitle = titleMatch ? titleMatch[1] : null;
+
+          if (videoTitle) {
+             fs.readdir(outDir, (err, files) => {
+                if (err) {
+                   return reject(new Error(`yt-dlp succeeded, but could not read output directory to find existing file. Stderr: ${stderrData}`));
+                }
+                const foundFile = files.find(f => f.includes(videoTitle));
+                if (foundFile) {
+                   finalPath = path.join(outDir, foundFile);
+                   logger.info({ url: videoUrl, path: finalPath }, 'Located pre-existing video download.');
+                   resolve(finalPath);
+                } else {
+                   reject(new Error(`yt-dlp succeeded, but failed to parse final file path or find existing file. Stdout: ${stdoutData}`));
+                }
+             });
+          } else {
+             reject(new Error(`yt-dlp succeeded, but failed to parse final file path. Stdout: ${stdoutData}`));
+          }
+        }
+      } else {
+        const errorMsg = `yt-dlp process exited with code ${code}. Stderr: ${stderrData}`;
+        reject(new Error(errorMsg));
+      }
+    });
+
+    ytDlp.on('error', (err) => {
+      reject(new Error(`Failed to start yt-dlp process: ${err.message}`));
+    });
   });
 }
 
@@ -2092,6 +2095,7 @@ async function delayUntil(condition, { interval = 200, timeout = 6000 } = {}) {
  */
 async function performShutdown(reason, exitCode = 0) {
   if (CRAWL_STATE.shuttingDown) {
+    logger.info("Shutdown is already in progress.");
     return;
   }
   CRAWL_STATE.shuttingDown = true;
@@ -2119,7 +2123,7 @@ async function performShutdown(reason, exitCode = 0) {
   if (CRAWL_STATE.activeVideoDownloads > 0) {
     logger.info(`Waiting for ${CRAWL_STATE.activeVideoDownloads} video(s) to finish downloading...`);
     try {
-      await delayUntil(() => (CRAWL_STATE.activeVideoDownloads <= 0), { timeout: 30000 });
+      await delayUntil(() => CRAWL_STATE.activeVideoDownloads <= 0, { timeout: 30000 });
       logger.info("All background downloads complete.");
     } catch (error) {
       logger.error({ err: error.message }, "Timeout waiting for downloads to complete. Some videos may not be saved.");
