@@ -30,3 +30,14 @@ pids
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Temporary files
+*.bak
+*.tmp
+.tmp/
+tmp/
+.old
+*.[0-9][0-9][0-9]
+*.[0-9][0-9][0-9].*
+*:Zone.Identifier
+
