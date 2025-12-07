@@ -112,11 +112,47 @@ node webclone.js --help
 -   `--concurrency <num>`: Number of concurrent browser pages to use (default: 3).
 -   `--videos <mode>`: Video download mode: `auto`, `all`, or `none` (default: `auto`).
 -   `--video-resolution <height>`: Maximum video height (e.g., `720`).
--   `--crawl-scope <scope>`: Crawl scope: `same-domain`, `subdomains`, `cross-domains` (default: `cross-domains`).
+-   `--crawl-scope <scope>`: Controls which domains the crawler is allowed to visit. See "Understanding Crawl Scope" below. (`same-domain`, `subdomains`, `cross-domains` (default: `cross-domains`)).
 -   `--show-browser`: Run the browser in a visible window for debugging.
 -   `--log-level <level>`: Set the logging level (`debug`, `info`, `warn`, `error`).
 
 ---
+
+### Understanding Crawl Scope
+
+The `--crawl-scope` option is crucial for controlling which external domains the archiver will visit. It helps define the boundaries of your crawl and prevents it from straying too far from your intended target.
+
+Here's how each scope option works:
+
+*   **`cross-domains` (Default):**
+    *   **Behavior:** This is the most permissive mode. The crawler will follow any navigable link it discovers, regardless of the domain. It will archive content from all linked websites.
+    *   **Use Case:** Ideal for archiving an entire web presence, following external references, or when you don't want to restrict domain access.
+
+*   **`same-domain`:**
+    *   **Behavior:** This is the strictest mode. A discovered link will only be followed if its **exact hostname** matches one of the exact hostnames of your initial starting URLs. Links to subdomains or entirely different domains will be ignored.
+    *   **Example:** If you start with `https://www.example.com/` and `https://blog.example.com/`, it will only crawl pages on `www.example.com` and `blog.example.com` respectively. A link from `www.example.com` to `sub.www.example.com` would be ignored.
+    *   **Use Case:** Perfect for archiving a single, specific website without drifting into its subdomains or external sites.
+
+*   **`subdomains`:**
+    *   **Behavior:** This mode is a middle ground. A discovered link will be followed if its **base domain** matches the base domain of one of your initial starting URLs. This means it will crawl across different subdomains of your primary target but will ignore entirely different top-level domains.
+    *   **Example:** If you start with `https://www.example.com/`, it will crawl `www.example.com`, `blog.example.com`, `shop.example.com`, etc., but will ignore `www.another-site.com`.
+    *   **Use Case:** Useful for archiving a company's entire web presence, including various services hosted on different subdomains.
+
+**Important Considerations:**
+
+*   **Start URLs Always Crawled:** The URL(s) you provide as command-line arguments are always processed, regardless of the `--crawl-scope` setting. These URLs define the initial boundaries of your scope.
+*   **Video Downloads:** URLs identified as direct video links (e.g., YouTube) are downloaded directly and are generally not subject to page-crawling scope rules.
+*   **Link Type:** Only "navigable" links (those pointing to HTML-like content) are considered for increasing crawl depth and applying scope rules. Links to assets (images, CSS, JS) are downloaded as part of the current page but are not checked against crawl scope rules to determine if *they themselves* should be crawled.
+
+### Exceptions to Crawl Scope Rules:
+
+While the `--crawl-scope` option provides strong control, there are a few scenarios where its rules are not strictly applied or are bypassed:
+
+*   **Initial Start URLs:** As mentioned above, the URL(s) you explicitly provide on the command line are always processed to kick off the crawl. They are considered within scope by definition.
+*   **Direct Video Downloads:** URLs that are recognized as direct video links (e.g., to YouTube or Vimeo) are immediately handed off to the video downloading component (`yt-dlp`). These operations bypass the page-crawling scope checks.
+*   **Dependent Assets (Images, CSS, Fonts, etc.):** The scope rules decide which **pages to navigate to**, not which assets to save. Once a page is deemed in-scope, the crawler will download all of its required assets (images, stylesheets, fonts) to ensure a complete archive, even if those assets are hosted on a different domain (like a CDN).
+*   **Invalid/Malformed URLs:** Links that cannot be parsed into valid URLs are discarded before any scope rules can be applied.
+*   **Rewritten Local Video Paths:** Once a video is downloaded, its URL is mapped to a local file, and these local paths are no longer subject to domain-based scope rules during rewriting.
 
 ## 🤝 Contributing
 
