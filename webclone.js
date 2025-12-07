@@ -512,8 +512,6 @@ async function main() {
   }, "Crawl scope initialized.");
   // --- End Scope ---
 
-
-
   let cookies = [];
 
   // --- Interactive Login Flow ---
@@ -662,19 +660,24 @@ async function main() {
     if (CONFIG.globalTimeoutMs > 0 && now - CRAWL_STATE.stats.startTime > CONFIG.globalTimeoutMs) {
       logger.warn("Global timeout reached. Forcing shutdown...");
       // This is a hard exit; it will not wait for active workers to finish.
+      clearInterval(monitorIntervalId);
       await performShutdown("Global Timeout", 1);
     }
     // Stall Timeout Check: Detects if the crawl has become stuck (no workers active, but queue is not empty).
     else if (CONFIG.stallTimeoutMs > 0 && now - CRAWL_STATE.stats.lastProgressTime > CONFIG.stallTimeoutMs && CRAWL_STATE.stats.activeWorkers === 0 && CRAWL_STATE.queue.length > 0) {
       logger.warn("Stall timeout reached. No progress has been made. Forcing shutdown...");
       // This is a hard exit, as the crawler is considered deadlocked.
+      clearInterval(monitorIntervalId);
       await performShutdown("Stall Timeout", 1);
     }
     // Completion Check: The normal exit condition for a successful crawl.
     else if (CRAWL_STATE.queue.length === 0 && CRAWL_STATE.stats.activeWorkers === 0 && CRAWL_STATE.activeVideoDownloads === 0) {
       logger.info("Queue is empty and all workers are idle. Crawl is complete.");
-      // This signals a graceful shutdown. The main `finally` block will call performShutdown.
-      CRAWL_STATE.shuttingDown = true;
+      // The worker loops will exit, Promise.allSettled will resolve,
+      // and the main `finally` block will handle the graceful shutdown.
+      clearInterval(monitorIntervalId);
+      await performShutdown("Crawl Complete", 0);
+      return;
     }
   }, 5000); // Check every 5 seconds
 
@@ -729,7 +732,6 @@ async function worker(browser, workerId, cookies) {
 
         if (err.message.includes('Target closed') || err.message.includes('Session closed')) {
           logger.fatal({ workerId, url, crawlId, err: err.message }, "Browser connection lost. Shutting down.");
-          CRAWL_STATE.shuttingDown = true;
           return; // Exit the worker, finally block will still run.
         }
 
@@ -751,7 +753,6 @@ async function worker(browser, workerId, cookies) {
 
         if (CRAWL_STATE.stats.consecutiveFailures >= CONFIG.maxConsecutiveFailures) {
           logger.fatal({ count: CRAWL_STATE.stats.consecutiveFailures }, "Max consecutive failures reached. Shutting down.");
-          CRAWL_STATE.shuttingDown = true;
           return; // Exit the worker, finally block will still run.
         }
 
@@ -798,8 +799,7 @@ async function crawlPage(browser, url, depth, cookies, crawlId) {
     const responsePromises = new Map();
     const recursivelyDiscoveredUrls = [];
     const setError = (err) => { if (!pageCrawlError) pageCrawlError = err; };
-    const allCssRegexes = [...CSS_URL_REGEX, IMPORT_REGEX].map(r => ({ source: r.source, flags: r.flags }));
-    responseHandler = setupResponseListener(page, responsePromises, depth, setError, allCssRegexes, recursivelyDiscoveredUrls, cookies);
+    const responseHandler = await setupResponseListener(page, responsePromises, depth, setError, recursivelyDiscoveredUrls, cookies);
 
     page.setDefaultNavigationTimeout(INTERNAL_CONSTANTS.navTimeoutMs);
     const mainResponse = await page.goto(url, { waitUntil: INTERNAL_CONSTANTS.waitUntil });
@@ -823,7 +823,7 @@ async function crawlPage(browser, url, depth, cookies, crawlId) {
     if (pageCrawlError) throw pageCrawlError;
 
     logger.debug({ crawlId }, "Discovering links and assets...");
-    const discoveredUrls = await discoverLinksAndAssets(page, allCssRegexes);
+    const discoveredUrls = await discoverLinksAndAssets(page);
 
     // Combine URLs from HTML discovery with URLs found recursively in CSS files.
     const allDiscoveredUrls = [...new Set([...discoveredUrls, ...recursivelyDiscoveredUrls])];
@@ -1205,9 +1205,11 @@ function urlToFilePath(rootDir, url, contentType, isPageHtml, forceExt = "") {
  * @param {Map<string, Promise>} responsePromises - A map to store promises for asset buffers.
  * @param {number} depth - The current crawl depth.
  * @param {Function} setError - A callback to signal an error to the parent crawlPage function.
+ * @param {string[]} recursivelyDiscoveredUrls - An array to push URLs found in CSS into.
+ * @param {Array} cookies - An array of cookie objects to set for the session.
  * @returns {Function} The event handler function that was attached.
  */
-async function setupResponseListener(page, responsePromises, depth, setError, cssRegexes, recursivelyDiscoveredUrls, cookies) {
+async function setupResponseListener(page, responsePromises, depth, setError, recursivelyDiscoveredUrls, cookies) {
   const responseHandler = (response) => {
     const responseUrl = normalizeUrl(response.url());
     if (!responseUrl || responsePromises.has(responseUrl) || CRAWL_STATE.shuttingDown) {
@@ -1260,7 +1262,7 @@ async function setupResponseListener(page, responsePromises, depth, setError, cs
           // --- RECURSIVE CSS DISCOVERY ---
           if (contentType.includes("text/css") || responseUrl.endsWith(".css")) {
             const cssText = buffer.toString("utf8");
-            const foundUrls = parseCssForUrls(cssText, responseUrl, cssRegexes);
+            const foundUrls = parseCssForUrls(cssText, responseUrl);
             for (const url of foundUrls) {
               recursivelyDiscoveredUrls.push(url);
             }
@@ -1289,8 +1291,8 @@ async function setupResponseListener(page, responsePromises, depth, setError, cs
  * @param {puppeteer.Page} page - The Puppeteer page instance.
  * @returns {Promise<string[]>} A promise that resolves to an array of discovered absolute URLs.
  */
-async function discoverLinksAndAssets(page, cssRegexes) {
-  return page.evaluate((regexes) => {
+async function discoverLinksAndAssets(page) {
+  return page.evaluate(() => {
     const urls = new Set();
     const add = (url) => {
       if (!url || /^(javascript:|data:|mailto:|tel:)/i.test(url)) return;
@@ -1300,15 +1302,17 @@ async function discoverLinksAndAssets(page, cssRegexes) {
       } catch {}
     };
 
-    // Helper function to parse CSS text, mirroring the Node.js helper.
-    const parseCssText = (cssText, baseUrl) => {
-      const urlRegexes = regexes.map(r => new RegExp(r.source, r.flags));
+    // Helper function to parse CSS text.
+    const parseCssText = (cssText) => {
+      const urlRegexes = [
+        /url\(\s*(['"]?)([^'")]+?)\1\s*\)/gi,
+        /@import\s+(?:url\(\s*(['"]?)([^'"]+?)\1\s*\)|(['"])([^'"]+?)\3)/gi,
+      ];
       for (const regex of urlRegexes) {
         let match;
-        regex.lastIndex = 0;
         while ((match = regex.exec(cssText)) !== null) {
           const url = match[2] || match[4];
-          if (url) add(url, baseUrl);
+          if (url) add(url);
         }
       }
     };
@@ -1340,7 +1344,7 @@ async function discoverLinksAndAssets(page, cssRegexes) {
     document.querySelectorAll('style').forEach(style => parseCssText(style.innerHTML));
 
     return Array.from(urls);
-  }, cssRegexes);
+  });
 }
 
 /**
@@ -1586,7 +1590,6 @@ function attemptSingleDownload(videoUrl, refererUrl = null, cookies = []) {
     logger.info({ url: videoUrl, args }, 'Spawning yt-dlp process...');
 
     const ytDlp = spawn(CONFIG.ytDlpPath, args, {
-      detached: true,
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
@@ -1934,10 +1937,10 @@ function inferExtension(urlString, contentType = "") {
  * @param {Array<{source: string, flags: string}>} cssRegexes - Serialized regexes.
  * @returns {Set<string>} A set of all absolute URLs found in the CSS.
  */
-function parseCssForUrls(cssText, baseUrl, cssRegexes) {
+function parseCssForUrls(cssText, baseUrl) {
   const urls = new Set();
   const absolutize = makeAbsolutizer(baseUrl);
-  const urlRegexes = cssRegexes.map(r => new RegExp(r.source, r.flags));
+  const urlRegexes = [...CSS_URL_REGEX, IMPORT_REGEX];
 
   for (const regex of urlRegexes) {
     let match;
@@ -2111,12 +2114,14 @@ async function performShutdown(reason, exitCode = 0) {
     // Correctly convert Set to array before iterating.
     for (const proc of Array.from(CRAWL_STATE.activeDownloadProcesses).reverse()) {
       logger.info({ reason }, `Closing ${proc.pid}`);
+      // Detach all listeners to prevent the event loop from waiting on the child's I/O.
+      proc.removeAllListeners();
       proc.kill('SIGTERM');
       CRAWL_STATE.activeDownloadProcesses.delete(proc);
       CRAWL_STATE.activeVideoDownloads--;
-      await sleep(600);
+      await sleep(100); // Brief pause to allow signal processing
     }
-    await sleep(200); // Give them a moment to terminate.
+    await sleep(200); // Give them all a moment to terminate.
   }
 
   // 2. Wait for any remaining video downloads to complete.
