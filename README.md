@@ -11,14 +11,15 @@ This project was born out of a specific need to archive comprehensive documentat
 
 ## ✨ Features
 
+-   **Intelligent Link Prioritization**: Uses a context-aware scoring system (based on link location in DOM and URL patterns) to prioritize important pages, ensuring more relevant content is archived first, especially in limited crawls.
 -   **Full Website Archiving**: Creates a fully self-contained offline copy of a website.
 -   **Link Rewriting**: Intelligently rewrites all links (`<a>`, `<img>`, `<script>`, `<link>`, CSS `url()`, etc.) to relative paths for seamless offline browsing.
--   **Video Downloading**: Automatically detects and downloads videos from YouTube, Vimeo, TikTok, and other popular sites using `yt-dlp`.
+-   **Video Downloading**: Automatically detects and downloads videos from YouTube, Vimeo, TikTok, and other popular sites using `yt-dlp`. Video file sizes are now included in the final statistics.
 -   **Authentication Support**: Archive content behind logins using session cookies.
     -   **Interactive Login**: Opens a browser for you to log in manually before starting the crawl.
     -   **Cookie File**: Use a `cookies.json` file exported from your browser.
 -   **Highly Configurable**: Control every aspect of the crawl, including depth, concurrency, crawl scope (same-domain, subdomains), timeouts, and more.
--   **Stealth & Robustness**: Uses `puppeteer-extra` with a stealth plugin to avoid bot detection and includes built-in retries and rate-limiting cool-downs.
+-   **Enhanced Robustness**: Features improved shutdown handling (graceful termination of child processes on `Ctrl+C`), efficient priority queue for scaling, and robust asset downloading.
 -   **Lazy-Loading Support**: Automatically scrolls pages to trigger and capture lazy-loaded content.
 
 ---
@@ -106,7 +107,7 @@ node webclone.js --help
 
 ## 🛠️ Key Configuration Options
 
--   `--cookies <path>`: Path to a `cookies.json` file.
+-   `--cookies <path>`: Path to a JSON file containing browser cookies.
 -   `--out-dir <path>`: The directory to save the archive (default: `./archive`).
 -   `--max-depth <num>`: Maximum crawl depth (default: 5).
 -   `--concurrency <num>`: Number of concurrent browser pages to use (default: 3).
@@ -153,6 +154,28 @@ While the `--crawl-scope` option provides strong control, there are a few scenar
 *   **Dependent Assets (Images, CSS, Fonts, etc.):** The scope rules decide which **pages to navigate to**, not which assets to save. Once a page is deemed in-scope, the crawler will download all of its required assets (images, stylesheets, fonts) to ensure a complete archive, even if those assets are hosted on a different domain (like a CDN).
 *   **Invalid/Malformed URLs:** Links that cannot be parsed into valid URLs are discarded before any scope rules can be applied.
 *   **Rewritten Local Video Paths:** Once a video is downloaded, its URL is mapped to a local file, and these local paths are no longer subject to domain-based scope rules during rewriting.
+
+### Understanding Link Prioritization
+
+WebClone.js now employs an **intelligent priority queue** to determine which discovered links to crawl next. Instead of a simple "first-in, first-out" approach, links are assigned a score based on various heuristics, ensuring that more important content is prioritized.
+
+Here's how the prioritization works:
+
+1.  **Contextual Scoring (Highest Priority):**
+    *   Links found within `<nav>` or `<header>` HTML elements receive the highest priority. These typically represent primary navigation points to key sections of a website.
+    *   Links found within a `<footer>` element receive the lowest priority, as they often point to less critical content like privacy policies, terms of service, or archives.
+
+2.  **URL Pattern Scoring:**
+    *   URLs with shorter, cleaner paths (e.g., `/products`, `/about`) are generally prioritized over those with complex paths or query parameters that might indicate deep, repetitive, or less important content.
+    *   URLs containing patterns like `/archive/`, `/tags/`, `/category/`, or `?page=` are deprioritized, as they often lead to extensive, less unique content.
+
+3.  **Depth as a Tie-Breaker:**
+    *   If two links have the same score, the link with the shallower crawl depth (closer to the starting URL) is prioritized.
+
+4.  **Initial Start URLs:**
+    *   The URLs you provide on the command line as starting points are automatically assigned the highest possible priority (`Infinity`) to ensure they are processed first.
+
+This intelligent prioritization helps WebClone.js to more effectively map and archive the most relevant parts of a website, especially when crawl limits (like `--max-pages` or `--max-depth`) are in place.
 
 ## 🤝 Contributing
 
