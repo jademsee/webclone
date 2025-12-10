@@ -55,13 +55,17 @@
 //
 // To archive content behind a login (e.g., private forums, subscription sites,
 // or age-restricted videos), you must provide a valid session cookie.
+// The easiest method is to use the built-in interactive login feature.
 //
-//   - Easiest Method (Recommended): Use `get-cookies.js`. This script opens a
-//     browser, lets you log in manually, and saves the session for you.
-//     Usage: `node get-cookies.js https://example.com/login`
+// 1. Run the script with `--interactive-login` and specify a file with `--save-cookies`.
+//    A browser will open, allowing you to log in manually.
 //
-//   - Alternative Method: Use `capture-cookies.js` to paste cookie data
-//     exported from your browser using a standard browser extension.
+//    node webclone.js --interactive-login --save-cookies ./my-session.json https://private.example.com/dashboard
+//
+// 2. After you log in and the script finishes, the `my-session.json` file can be
+//    reused in future runs with the `--cookies` flag to skip the interactive login.
+//
+//    node webclone.js --cookies ./my-session.json https://private.example.com/dashboard
 //
 
 const fs = require("fs");
@@ -102,7 +106,7 @@ const argv = yargs(hideBin(process.argv))
   })
   .option('save-cookies', {
     type: 'string',
-    description: 'Path to save session cookies to after a successful interactive login.',
+    description: 'Path to save session cookies in JSON format after a successful interactive login. This file can be reused with the --cookies flag.',
     normalize: true,
   })
   .option('out-dir', {
@@ -454,7 +458,7 @@ const DIRECT_VIDEO_URL_PATTERNS = [
   /^https?:\/\/vimeo\.com\/\d+/,
   /^https?:\/\/(www\.)?dailymotion\.com\/video\//,
   /^https?:\/\/(www\.)?tiktok\.com\/.*\/video\//,
-  /^https?:\/\/(www\.)?facebook\.com\/reel\//, // Added for Facebook Reels
+  /^https?:\/\/(www\.)?facebook\.com\/(watch|stories|reel)\//,
   /^https?:\/\/(www\.)?bilibili\.com\/video\/(av|BV)/,
   /^https?:\/\/(www\.)?bilibili\.tv\/[a-z]{2}\/(play|video)\/\d+/,
 ];
@@ -599,7 +603,8 @@ async function main() {
         initialVideoPromises.push(videoPromise);
       }
     } else {
-      enqueue(startUrl, 0);
+      // Start URLs get the highest possible priority.
+      enqueue(startUrl, 0, Infinity);
     }
   }
 
@@ -704,7 +709,7 @@ async function worker(browser, workerId, cookies) {
       break;
     }
 
-    const crawlJob = CRAWL_STATE.queue.shift();
+    const crawlJob = CRAWL_STATE.queue.pop();
 
     if (crawlJob) {
       const { url, depth, retries, crawlId } = crawlJob;
@@ -825,46 +830,70 @@ async function crawlPage(browser, url, depth, cookies, crawlId) {
     logger.debug({ crawlId }, "Discovering links and assets...");
     const discoveredUrls = await discoverLinksAndAssets(page);
 
-    // Combine URLs from HTML discovery with URLs found recursively in CSS files.
-    const allDiscoveredUrls = [...new Set([...discoveredUrls, ...recursivelyDiscoveredUrls])];
-    logger.debug({ crawlId, count: allDiscoveredUrls.length }, "Discovery complete.");
+    // discoveredUrls is now an array of objects: [{url, context}]
+    // Handle URLs found recursively inside CSS files (they have no special context)
+    for (const recursiveUrl of recursivelyDiscoveredUrls) {
+      discoveredUrls.push({ url: recursiveUrl, context: 'body' });
+    }
+
+    // De-duplicate URLs, keeping the one with the highest-priority context
+    const uniqueLinks = new Map();
+    const contextPriority = { nav: 3, header: 2, body: 1, footer: 0 };
+    for (const link of discoveredUrls) {
+        const existing = uniqueLinks.get(link.url);
+        if (!existing || (contextPriority[link.context] > contextPriority[existing.context || 'footer'])) {
+            uniqueLinks.set(link.url, link);
+        }
+    }
+    logger.debug({ crawlId, count: uniqueLinks.size }, "Discovery complete.");
 
     // Predict records for all discovered URLs *before* rewriting.
     // This ensures the rewriter knows where to point links.
-    for (const discoveredUrl of allDiscoveredUrls) {
-      const isNavigable = looksNavigable(discoveredUrl);
-      const isVideo = isDirectVideoUrl(discoveredUrl);
+    for (const link of uniqueLinks.values()) {
+      const isNavigable = looksNavigable(link.url);
+      const isVideo = isDirectVideoUrl(link.url);
 
-      if (CONFIG.videos !== 'none' && isVideo && !CRAWL_STATE.processedVideos.has(discoveredUrl)) {
-        CRAWL_STATE.processedVideos.add(discoveredUrl);
-        CRAWL_STATE.activeVideoDownloads++;
+      if (CONFIG.videos !== 'none' && isVideo && !CRAWL_STATE.processedVideos.has(link.url)) {
+        CRAWL_STATE.processedVideos.add(link.url);
+        
+        // Use an IIFE to handle the async video processing without blocking the main loop.
+        (async () => {
+          try {
+            CRAWL_STATE.activeVideoDownloads++;
+            // First, quickly get the final path. This is a fast operation.
+            const localPath = await getVideoFilePath(link.url, url, cookies);
+            // With the path known, register it for link rewriting immediately.
+            CRAWL_STATE.videoUrlMap.set(link.url, localPath);
 
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Video download timed out')), INTERNAL_CONSTANTS.videoDownloadTimeoutMs)
-        );
-
-        Promise.race([downloadVideo(discoveredUrl, url, cookies), timeoutPromise])
-          .then(localPath => {
-            CRAWL_STATE.videoUrlMap.set(discoveredUrl, localPath);
-          })
-          .catch(err => {
-            logger.error({ err, url: discoveredUrl }, 'Video download failed permanently.');
-            // CRITICAL: If download fails, remove from map to prevent broken links.
-            CRAWL_STATE.videoUrlMap.delete(discoveredUrl);
-          })
-          .finally(() => {
+            // Now, start the actual download as a background task.
+            // We don't await this, allowing the crawl to continue.
+            downloadVideo(link.url, url, cookies)
+              .catch(err => {
+                logger.error({ err, url: link.url }, 'Video download failed permanently in background.');
+                // If the download fails, remove it from the map so links don't point to a missing file.
+                CRAWL_STATE.videoUrlMap.delete(link.url);
+              })
+              .finally(() => {
+                CRAWL_STATE.activeVideoDownloads--;
+              });
+          } catch (err) {
+            logger.error({ err, url: link.url }, 'Failed to get video file path.');
             CRAWL_STATE.activeVideoDownloads--;
-          });
+          }
+        })();
       } else if (isNavigable && !isVideo) {
-        enqueue(discoveredUrl, depth + 1);
+        const score = getLinkScore(link); // Pass the whole link object
+        enqueue(link.url, depth + 1, score);
       }
-      predictRecord(discoveredUrl, isNavigable, url);
+      predictRecord(link.url, isNavigable, url);
     }
 
     // Check again before fetching more assets.
     if (pageCrawlError) throw pageCrawlError;
 
-    await fetchDiscoveredAssets(page, allDiscoveredUrls, responsePromises);
+    // Re-construct the flat list of URL strings for the asset fetcher.
+    const allDiscoveredUrlStrings = Array.from(uniqueLinks.keys());
+    await fetchDiscoveredAssets(page, allDiscoveredUrlStrings, responsePromises);
 
     const capturedResponses = await resolveAssetResponses(responsePromises);
 
@@ -1293,57 +1322,76 @@ async function setupResponseListener(page, responsePromises, depth, setError, re
  */
 async function discoverLinksAndAssets(page) {
   return page.evaluate(() => {
-    const urls = new Set();
-    const add = (url) => {
-      if (!url || /^(javascript:|data:|mailto:|tel:)/i.test(url)) return;
+    const links = new Map(); // Use a Map to store unique URLs with their best-found context
+
+    const addLink = (url, context = 'body') => {
+      let resolvedUrl;
       try {
-        // Resolve the URL against the page's location and add it to the set.
-        urls.add(new URL(url, location.href).toString());
-      } catch {}
-    };
+        if (!url || /^(javascript:|data:|mailto:|tel:)/i.test(url)) return;
+        resolvedUrl = new URL(url, location.href).toString().split("#")[0];
+      } catch {
+        return; // Skip invalid URLs
+      }
 
-    // Helper function to parse CSS text.
-    const parseCssText = (cssText) => {
-      const urlRegexes = [
-        /url\(\s*(['"]?)([^'")]+?)\1\s*\)/gi,
-        /@import\s+(?:url\(\s*(['"]?)([^'"]+?)\1\s*\)|(['"])([^'"]+?)\3)/gi,
-      ];
-      for (const regex of urlRegexes) {
-        let match;
-        while ((match = regex.exec(cssText)) !== null) {
-          const url = match[2] || match[4];
-          if (url) add(url);
-        }
+      // Use a priority system for context. If we find a link in the 'body' first,
+      // and then later find the *same link* in the 'nav', we should update its context to 'nav'.
+      const priority = { nav: 3, header: 2, body: 1, footer: 0 };
+      const existing = links.get(resolvedUrl);
+
+      if (!existing || (priority[context] > priority[existing.context || 'footer'])) {
+        links.set(resolvedUrl, { context });
       }
     };
 
-    // 1. Discover from standard attributes
-    const elements = document.querySelectorAll(
-      '[href], [src], [srcset], [action], object[data], html[manifest], [poster]'
+    // 1. Discover from <a> tags and determine context
+    for (const el of document.querySelectorAll('a[href]')) {
+      let context = 'body';
+      if (el.closest('nav')) {
+        context = 'nav';
+      } else if (el.closest('header')) {
+        context = 'header';
+      } else if (el.closest('footer')) {
+        context = 'footer';
+      }
+      addLink(el.getAttribute('href'), context);
+    }
+    
+    // 2. Discover from other standard attributes (these get default 'body' context)
+    const otherElements = document.querySelectorAll(
+        '[src], [action], object[data], html[manifest], [poster]'
     );
-
-    for (const el of elements) {
-      add(el.getAttribute('href'));
-      add(el.getAttribute('src'));
-      add(el.getAttribute('action'));
-      add(el.getAttribute('data'));
-      add(el.getAttribute('manifest'));
-      add(el.getAttribute('poster'));
-
-      const srcset = el.getAttribute('srcset');
-      if (srcset) {
-        for (const part of srcset.split(',')) {
-          const url = part.trim().split(/\s+/)[0];
-          if (url) add(url);
+    for (const el of otherElements) {
+        addLink(el.getAttribute('src'));
+        addLink(el.getAttribute('action'));
+        addLink(el.getAttribute('data'));
+        addLink(el.getAttribute('manifest'));
+        addLink(el.getAttribute('poster'));
+    }
+    
+    // 3. Discover from srcset (default 'body' context)
+    for (const el of document.querySelectorAll('[srcset]')) {
+        const srcset = el.getAttribute('srcset');
+        if (srcset) {
+            for (const part of srcset.split(',')) {
+                const url = part.trim().split(/\s+/)[0];
+                if (url) addLink(url);
+            }
         }
-      }
     }
 
-    // 2. Discover from CSS url() values in inline styles and <style> tags
+    // 4. Discover from CSS in <style> tags (default 'body' context)
+    const parseCssText = (cssText) => {
+        const urlRegex = /url\(\s*(['"]?)([^'")]+?)\1\s*\)/gi;
+        let match;
+        while ((match = urlRegex.exec(cssText)) !== null) {
+            if (match[2]) addLink(match[2]);
+        }
+    };
     document.querySelectorAll('[style]').forEach(el => parseCssText(el.getAttribute('style')));
     document.querySelectorAll('style').forEach(style => parseCssText(style.innerHTML));
 
-    return Array.from(urls);
+    // Convert Map to the desired array format: [{ url, context }]
+    return Array.from(links, ([url, { context }]) => ({ url, context }));
   });
 }
 
@@ -1522,20 +1570,110 @@ async function handleEvictedAsset(responseUrl, contentType, cookies, pageUrl) {
 }
 
 /**
+ * Determines the final local path for a video without downloading it, using yt-dlp.
+ * It includes fallback logic to handle filenames that are too long.
+ * @param {string} videoUrl - The URL of the video.
+ * @param {string|null} refererUrl - The referer URL.
+ * @param {Array} cookies - An array of cookie objects.
+ * @returns {Promise<string>} A promise that resolves with the predicted local file path.
+ */
+async function getVideoFilePath(videoUrl, refererUrl = null, cookies = []) {
+  const videoHost = new URL(videoUrl).hostname.replace('www.', '');
+  const outDir = path.join(CONFIG.outDir, videoHost);
+
+  const runGetFilename = (outputTemplate) => {
+    return new Promise(async (resolve, reject) => {
+      let tempCookiePath = null;
+      const args = [
+        videoUrl,
+        '--no-playlist',
+        '--get-filename',
+        '-o', outputTemplate,
+      ];
+      try {
+        if (CONFIG.cookiePath) {
+          args.push('--cookies', CONFIG.cookiePath);
+        } else if (cookies && cookies.length > 0) {
+          const netscapeCookies = cookies.map(c => {
+            const domain = c.domain.startsWith('.') ? c.domain : `.${c.domain}`;
+            const httpOnly = c.httpOnly ? 'TRUE' : 'FALSE';
+            const secure = c.secure ? 'TRUE' : 'FALSE';
+            return [domain, httpOnly, c.path, secure, c.expires || 0, c.name, c.value].join('\t');
+          }).join('\n');
+          tempCookiePath = path.join(os.tmpdir(), `webclone-cookies-${Date.now()}.txt`);
+          await fs.promises.writeFile(tempCookiePath, netscapeCookies);
+          args.push('--cookies', tempCookiePath);
+        }
+        
+        const ytDlp = spawn(CONFIG.ytDlpPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdoutData = '', stderrData = '';
+        ytDlp.stdout.on('data', (data) => { stdoutData += data.toString(); });
+        ytDlp.stderr.on('data', (data) => { stderrData += data.toString(); });
+
+        ytDlp.on('close', async (code) => {
+          if (tempCookiePath) {
+            await fs.promises.unlink(tempCookiePath).catch(() => {});
+          }
+          if (code === 0) {
+            resolve(stdoutData.trim());
+          } else {
+            if (stderrData.includes('File name too long')) {
+              return reject(new Error('FILE_NAME_TOO_LONG'));
+            }
+            reject(new Error(`yt-dlp --get-filename failed: ${stderrData}`));
+          }
+        });
+        ytDlp.on('error', (err) => reject(err));
+      } catch (err) {
+        if (tempCookiePath) {
+          await fs.promises.unlink(tempCookiePath).catch(() => {});
+        }
+        reject(err);
+      }
+    });
+  };
+
+  try {
+    return await runGetFilename(path.join(outDir, '%(title)s.%(ext)s'));
+  } catch (err) {
+    if (err.message === 'FILE_NAME_TOO_LONG') {
+      logger.warn({ url: videoUrl }, "Filename from title was too long, getting path with video ID.");
+      return await runGetFilename(path.join(outDir, '%(id)s.%(ext)s'));
+    }
+    throw err;
+  }
+}
+
+/**
  * Downloads a video from a given URL using yt-dlp, with a retry mechanism.
+ * Automatically attempts to transform Facebook Watch URLs to Reel URLs for better compatibility.
  * @param {string} videoUrl - The URL of the video to download.
  * @returns {Promise<string>} A promise that resolves with the local file path of the downloaded video.
  */
 async function downloadVideo(videoUrl, refererUrl = null, cookies = []) {
+  let downloadUrl = videoUrl;
+  try {
+    const urlObj = new URL(videoUrl);
+    if (urlObj.hostname.includes('facebook.com') && urlObj.pathname.includes('/watch/')) {
+      const videoId = urlObj.searchParams.get('v');
+      if (videoId) {
+        downloadUrl = `https://www.facebook.com/reel/${videoId}`;
+        logger.info({ originalUrl: videoUrl, newUrl: downloadUrl }, "Attempting to transform Facebook Watch URL to Reel URL for compatibility.");
+      }
+    }
+  } catch (e) {
+    logger.warn({ err: e.message, url: videoUrl }, "Could not parse URL for potential transformation.");
+  }
+
   let lastError = null;
   for (let attempt = 1; attempt <= INTERNAL_CONSTANTS.videoMaxRetries; attempt++) {
     try {
-      logger.info({ url: videoUrl, attempt }, "Attempting to download video...");
-      const filePath = await attemptSingleDownload(videoUrl, refererUrl, cookies);
+      logger.info({ url: downloadUrl, attempt }, "Attempting to download video...");
+      const filePath = await attemptSingleDownload(downloadUrl, refererUrl, cookies);
       return filePath; // Success
     } catch (err) {
       lastError = err;
-      logger.warn({ url: videoUrl, attempt, max: INTERNAL_CONSTANTS.videoMaxRetries, err: err.message }, "Video download attempt failed.");
+      logger.warn({ url: downloadUrl, attempt, max: INTERNAL_CONSTANTS.videoMaxRetries, err: err.message }, "Video download attempt failed.");
       if (attempt < INTERNAL_CONSTANTS.videoMaxRetries) {
         const delay = randInt(...INTERNAL_CONSTANTS.randomDelayMs);
         logger.info(`Waiting ${delay}ms before next attempt...`);
@@ -1543,117 +1681,219 @@ async function downloadVideo(videoUrl, refererUrl = null, cookies = []) {
       }
     }
   }
-  logger.error({ url: videoUrl, retries: INTERNAL_CONSTANTS.videoMaxRetries }, "All video download attempts failed.");
+  logger.error({ url: downloadUrl, retries: INTERNAL_CONSTANTS.videoMaxRetries }, "All video download attempts failed.");
   throw lastError;
 }
 
 /**
- * Attempts a single video download using yt-dlp. This function is wrapped by the main downloadVideo function which contains the retry logic.
+ * Attempts a single video download using yt-dlp, with a filename fallback mechanism.
+ * It first tries to save the video using its title. If the filename is too long, it retries
+ * once using the video's unique ID. This function handles its own temporary cookie file
+ * conversion and cleanup. It is called by `downloadVideo`, which manages broader download retries.
  * @param {string} videoUrl - The URL of the video to download.
  * @param {string|null} refererUrl - The referer URL.
+ * @param {Array} cookies - An array of cookie objects to use for the download.
  * @returns {Promise<string>} A promise that resolves with the local file path.
  */
-function attemptSingleDownload(videoUrl, refererUrl = null, cookies = []) {
-  return new Promise((resolve, reject) => {
-    const videoHost = new URL(videoUrl).hostname.replace('www.', '');
-    const outDir = path.join(CONFIG.outDir, videoHost);
-    const outputPathTemplate = path.join(outDir, '%(title)s.%(ext)s');
+async function attemptSingleDownload(videoUrl, refererUrl = null, cookies = []) {
+  const videoHost = new URL(videoUrl).hostname.replace('www.', '');
+  const outDir = path.join(CONFIG.outDir, videoHost);
+  let useIdAsFilename = false; // Flag to control filename strategy
+
+  for (let i = 0; i < 2; i++) { // Max two attempts: one with title, one with ID (if title fails)
+    let outputPathTemplate;
+    if (useIdAsFilename) {
+      outputPathTemplate = path.join(outDir, '%(id)s.%(ext)s');
+      logger.info({ url: videoUrl }, "Retrying download with video ID as filename.");
+    } else {
+      outputPathTemplate = path.join(outDir, '%(title)s.%(ext)s');
+    }
+    
+    let tempCookiePath = null;
 
     const args = [
       videoUrl,
       '--no-playlist',
       '-o', outputPathTemplate,
+      '--clean-info-json',
     ];
 
-    if (CONFIG.cookiePath) {
-      args.push('--cookies', CONFIG.cookiePath);
-    }
+    try {
+      if (CONFIG.cookiePath) {
+        args.push('--cookies', CONFIG.cookiePath);
+      } else if (cookies && cookies.length > 0) {
+        // Convert Puppeteer's JSON cookie format to the Netscape format required by yt-dlp.
+        const netscapeCookies = cookies.map(c => {
+          const domain = c.domain.startsWith('.') ? c.domain : `.${c.domain}`;
+          const httpOnly = c.httpOnly ? 'TRUE' : 'FALSE';
+          const secure = c.secure ? 'TRUE' : 'FALSE';
+          // Columns: domain, httpOnly, path, secure, expires, name, value
+          return [domain, httpOnly, c.path, secure, c.expires || 0, c.name, c.value].join('\t');
+        }).join('\n');
 
-    const referer = refererUrl || new URL(videoUrl).origin;
-    args.push('--referer', referer);
-    args.push('--user-agent', CONFIG.userAgent);
-
-    let formatString;
-    if (CONFIG.videoResolution) {
-      const H = CONFIG.videoResolution;
-      const p1 = `best[height<=${H}][ext=mp4]`; // Priority 1: Ideal pre-merged MP4.
-      const p2 = `best[height<=${H}]`; // Priority 2: Any pre-merged format at target res.
-      const p3 = `worstvideo[height>${H}]+bestaudio`; // Priority 3: Next-highest resolution, merged.
-      const p4 = `bestvideo+bestaudio/best`; // Priority 4: Absolute best, merged.
-      formatString = `${p1}/${p2}/${p3}/${p4}`;
-    } else {
-      // Default if no resolution is specified: try pre-merged mp4, then any pre-merged, then merge the best.
-      formatString = 'best[ext=mp4]/best/bestvideo+bestaudio';
-    }
-    args.push('-f', formatString);
-
-    logger.info({ url: videoUrl, args }, 'Spawning yt-dlp process...');
-
-    const ytDlp = spawn(CONFIG.ytDlpPath, args, {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    CRAWL_STATE.activeDownloadProcesses.add(ytDlp);
-    let stdoutData = '';
-    let stderrData = '';
-
-    ytDlp.stdout.on('data', (data) => {
-      stdoutData += data.toString();
-    });
-
-    ytDlp.stderr.on('data', (data) => {
-      stderrData += data.toString();
-    });
-
-    ytDlp.on('close', (code) => {
-      CRAWL_STATE.activeDownloadProcesses.delete(ytDlp);
-
-      if (code === 0) {
-        let finalPath = null;
-        let match = stdoutData.match(/\[download\] Destination: (.*)/) || stdoutData.match(/\[download\] (.*) has already been downloaded/);
-        if (match && match[1]) {
-          finalPath = match[1].trim();
-        }
-
-        if (finalPath) {
-          logger.info({ url: videoUrl, path: finalPath }, 'Video download complete.');
-          resolve(finalPath);
-        } else {
-          // This can happen if the video was already downloaded in a previous run.
-          // yt-dlp exits 0 but doesn't print the "Destination" line.
-          // We need to find the file manually in this case.
-          const videoTitleRegex = /\[info\] (?:(?:NA|Downloading)\s+page|Extracting\s+data|Resolving\s+extractor|Downloading\s+m3u8)\s+for\s+"([^"]+)"/;
-          const titleMatch = stdoutData.match(videoTitleRegex);
-          const videoTitle = titleMatch ? titleMatch[1] : null;
-
-          if (videoTitle) {
-             fs.readdir(outDir, (err, files) => {
-                if (err) {
-                   return reject(new Error(`yt-dlp succeeded, but could not read output directory to find existing file. Stderr: ${stderrData}`));
-                }
-                const foundFile = files.find(f => f.includes(videoTitle));
-                if (foundFile) {
-                   finalPath = path.join(outDir, foundFile);
-                   logger.info({ url: videoUrl, path: finalPath }, 'Located pre-existing video download.');
-                   resolve(finalPath);
-                } else {
-                   reject(new Error(`yt-dlp succeeded, but failed to parse final file path or find existing file. Stdout: ${stdoutData}`));
-                }
-             });
-          } else {
-             reject(new Error(`yt-dlp succeeded, but failed to parse final file path. Stdout: ${stdoutData}`));
-          }
-        }
-      } else {
-        const errorMsg = `yt-dlp process exited with code ${code}. Stderr: ${stderrData}`;
-        reject(new Error(errorMsg));
+        tempCookiePath = path.join(os.tmpdir(), `webclone-cookies-${Date.now()}.txt`);
+        await fs.promises.writeFile(tempCookiePath, netscapeCookies);
+        args.push('--cookies', tempCookiePath);
       }
-    });
 
-    ytDlp.on('error', (err) => {
-      reject(new Error(`Failed to start yt-dlp process: ${err.message}`));
-    });
-  });
+      const referer = refererUrl || new URL(videoUrl).origin;
+      args.push('--referer', referer);
+      args.push('--user-agent', CONFIG.userAgent);
+
+      let formatString;
+      if (CONFIG.videoResolution) {
+        const H = CONFIG.videoResolution;
+        const p1 = `best[height<=${H}][ext=mp4]`; // Priority 1: Ideal pre-merged MP4.
+        const p2 = `best[height<=${H}]`; // Priority 2: Any pre-merged format at target res.
+        const p3 = `worstvideo[height>${H}]+bestaudio`; // Priority 3: Next-highest resolution, merged.
+        const p4 = `bestvideo+bestaudio/best`; // Priority 4: Absolute best, merged.
+        formatString = `${p1}/${p2}/${p3}/${p4}`;
+      } else {
+        // Default if no resolution is specified: try pre-merged mp4, then any pre-merged, then merge the best.
+        formatString = 'best[ext=mp4]/best/bestvideo+bestaudio';
+      }
+      args.push('-f', formatString);
+
+      logger.info({ url: videoUrl, args }, 'Spawning yt-dlp process...');
+
+      const ytDlp = spawn(CONFIG.ytDlpPath, args, {
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      CRAWL_STATE.activeDownloadProcesses.add(ytDlp);
+      let stdoutData = '';
+      let stderrData = '';
+
+      ytDlp.stdout.on('data', (data) => {
+        stdoutData += data.toString();
+      });
+
+      ytDlp.stderr.on('data', (data) => {
+        stderrData += data.toString();
+      });
+
+      const cleanup = async () => {
+        CRAWL_STATE.activeDownloadProcesses.delete(ytDlp);
+        if (tempCookiePath) {
+          await fs.promises.unlink(tempCookiePath).catch(err => {
+            logger.warn({ err, path: tempCookiePath }, "Could not delete temporary cookie file.");
+          });
+        }
+      };
+
+      const downloadPromise = new Promise((resolveInner, rejectInner) => {
+        ytDlp.on('close', async (code) => {
+          cleanup();
+          if (code === 0) {
+            let finalPath = null;
+            let match = stdoutData.match(/\[download\] Destination: (.*)/) || stdoutData.match(/\[download\] (.*) has already been downloaded/);
+            if (match && match[1]) {
+              finalPath = match[1].trim();
+            }
+
+            if (finalPath) {
+              logger.info({ url: videoUrl, path: finalPath }, 'Video download complete.');
+              try {
+                const stats = await fs.promises.stat(finalPath);
+                CRAWL_STATE.stats.totalBytes += stats.size;
+              } catch (err) {
+                logger.warn({ err, path: finalPath }, "Could not get file stats for downloaded video.");
+              }
+              resolveInner(finalPath);
+            } else {
+              const videoTitleRegex = /\[info\] (?:(?:NA|Downloading)\s+page|Extracting\s+data|Resolving\s+extractor|Downloading\s+m3u8)\s+for\s+"([^"]+)"/;
+              const titleMatch = stdoutData.match(videoTitleRegex);
+              const videoTitle = titleMatch ? titleMatch[1] : null;
+
+              if (videoTitle) {
+                try {
+                  const files = await fs.promises.readdir(outDir);
+                  const foundFile = files.find(f => f.includes(videoTitle));
+                  if (foundFile) {
+                    finalPath = path.join(outDir, foundFile);
+                    logger.info({ url: videoUrl, path: finalPath }, 'Located pre-existing video download.');
+                    try {
+                      const stats = await fs.promises.stat(finalPath);
+                      CRAWL_STATE.stats.totalBytes += stats.size;
+                    } catch (err) {
+                      logger.warn({ err, path: finalPath }, "Could not get file stats for pre-existing video.");
+                    }
+                    resolveInner(finalPath);
+                  } else {
+                    rejectInner(new Error(`yt-dlp succeeded, but failed to parse final file path or find existing file. Stdout: ${stdoutData}`));
+                  }
+                } catch (err) {
+                  rejectInner(new Error(`yt-dlp succeeded, but could not read output directory to find existing file. Stderr: ${stderrData}`));
+                }
+              } else {
+                rejectInner(new Error(`yt-dlp succeeded, but failed to parse final file path. Stdout: ${stdoutData}`));
+              }
+            }
+          } else {
+            let errorMsg = `yt-dlp process exited with code ${code}. Stderr: ${stderrData}`;
+            if (stderrData.includes('Cannot parse data') || stderrData.includes('please report this issue')) {
+              errorMsg += "\nHint: This often means your yt-dlp is outdated. Please try updating it with 'yt-dlp -U'";
+            }
+            if (stderrData.includes('File name too long')) {
+              return rejectInner(new Error('FILE_NAME_TOO_LONG'));
+            }
+            rejectInner(new Error(errorMsg));
+          }
+        });
+
+        ytDlp.on('error', (err) => {
+          cleanup();
+          rejectInner(new Error(`Failed to start yt-dlp process: ${err.message}`));
+        });
+      });
+      return await downloadPromise;
+    } catch (err) {
+      if (tempCookiePath) {
+        await fs.promises.unlink(tempCookiePath).catch(unlinkErr => {
+          logger.warn({ err: unlinkErr, path: tempCookiePath }, "Could not delete temporary cookie file during error handling.");
+        });
+      }
+      // If the error is 'FILE_NAME_TOO_LONG', and we haven't tried with ID yet, set flag and continue loop.
+      if (err.message === 'FILE_NAME_TOO_LONG' && !useIdAsFilename) {
+        useIdAsFilename = true; // Try with ID in the next loop iteration
+      } else {
+        throw err; // Re-throw other errors or if already tried with ID
+      }
+    }
+  }
+  // If we exit the loop, it means both attempts failed.
+  throw new Error("Video download failed after attempting both title and ID filenames.");
+}
+
+/**
+ * Calculates a priority score for a URL based on heuristics.
+ * @param {string} url - The URL to score.
+ * @returns {number} A numerical score (higher is higher priority).
+ */
+function getLinkScore(link) { // link is an object: { url, context }
+  // 1. Context Scoring
+  if (link.context === 'nav' || link.context === 'header') return 10;
+  if (link.context === 'footer') return 1;
+
+  try {
+    const urlObj = new URL(link.url);
+    const path = urlObj.pathname.toLowerCase();
+    const pathDepth = path.split('/').filter(Boolean).length;
+
+    // 2. URL Pattern Scoring
+    if (path.includes('/archive') || path.includes('/tags/') || path.includes('/category/') || urlObj.search.includes('page=')) {
+      return 2; // Low priority
+    }
+
+    // 3. Path Depth-based scoring
+    if (pathDepth <= 1) return 8; // High priority for top-level pages
+    if (pathDepth > 4) return 3; // Lower priority for very deep pages
+    
+    // 4. Default score for 'body' context
+    return 5;
+  } catch {
+    return 5; // Default score on URL parsing error
+  }
 }
 
 /* ---------- CRAWL QUEUE ---------- */
@@ -1662,7 +1902,38 @@ function attemptSingleDownload(videoUrl, refererUrl = null, cookies = []) {
  * @param {string} url - The URL to enqueue.
  * @param {number} depth - The current crawl depth.
  */
-function enqueue(url, depth) {
+/**
+ * Finds the correct index to insert a new job into the sorted queue
+ * using binary search to maintain priority order.
+ * @param {object} job - The crawl job to be inserted.
+ * @returns {number} The index at which to insert the job.
+ */
+function getInsertIndex(job) {
+    let low = 0;
+    let high = CRAWL_STATE.queue.length;
+
+    // The comparator function defines the sort order.
+    // The goal is to have the highest score at the END of the array for efficient pop().
+    // So, we sort by: 1. ascending score, 2. descending depth (so lower depth is at the end).
+    const compare = (a, b) => {
+        if (a.score !== b.score) {
+            return a.score - b.score;
+        }
+        return b.depth - a.depth;
+    };
+
+    while (low < high) {
+        const mid = (low + high) >>> 1; // Integer division
+        if (compare(job, CRAWL_STATE.queue[mid]) >= 0) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+function enqueue(url, depth, score = 5) {
   const norm = normalizeUrl(url);
   if (!norm || CRAWL_STATE.enqueued.has(norm) || CRAWL_STATE.visited.has(norm)) return;
 
@@ -1691,7 +1962,13 @@ function enqueue(url, depth) {
 
   const crawlId = hash(norm).slice(0, 8);
   CRAWL_STATE.enqueued.add(norm);
-  CRAWL_STATE.queue.push({ url: norm, depth, retries: 0, crawlId });
+
+  const job = { url: norm, depth, retries: 0, crawlId, score };
+
+  // Find the correct insertion point in the sorted queue and insert.
+  const index = getInsertIndex(job);
+  CRAWL_STATE.queue.splice(index, 0, job);
+
   predictRecord(norm, true);
 }
 
@@ -2109,19 +2386,43 @@ async function performShutdown(reason, exitCode = 0) {
   process.removeListener("SIGTERM", sigtermHandler);
 
   // 1. Terminate active downloads if exiting due to an error/signal.
-  if (exitCode && (CRAWL_STATE.activeVideoDownloads > 0)) {
-    logger.info(`Terminating ${CRAWL_STATE.activeDownloadProcesses.size} active download process(es)...`);
-    // Correctly convert Set to array before iterating.
-    for (const proc of Array.from(CRAWL_STATE.activeDownloadProcesses).reverse()) {
-      logger.info({ reason }, `Closing ${proc.pid}`);
-      // Detach all listeners to prevent the event loop from waiting on the child's I/O.
-      proc.removeAllListeners();
-      proc.kill('SIGTERM');
-      CRAWL_STATE.activeDownloadProcesses.delete(proc);
-      CRAWL_STATE.activeVideoDownloads--;
-      await sleep(100); // Brief pause to allow signal processing
+  if (exitCode && (CRAWL_STATE.activeDownloadProcesses.size > 0)) {
+    const processesToKill = Array.from(CRAWL_STATE.activeDownloadProcesses).reverse();
+    logger.info(`Terminating ${processesToKill.length} active download process(es)...`);
+
+    // 1. Gracefully signal all processes to terminate in parallel
+    for (const proc of processesToKill) {
+      logger.info({ reason }, `Signaling graceful shutdown for process: ${proc.pid}`);
+      try {
+        // Detach I/O listeners to prevent hangs
+        proc.stdout?.removeAllListeners();
+        proc.stderr?.removeAllListeners();
+        proc.kill('SIGTERM');
+        await sleep(100);
+      } catch (e) {
+        logger.warn({ pid: proc.pid, err: e.message }, `Error sending SIGTERM to process, it may have already exited.`);
+      }
     }
-    await sleep(200); // Give them all a moment to terminate.
+
+    // 2. Wait a moment for graceful shutdown
+    if (CRAWL_STATE.activeDownloadProcesses.size) {
+      await sleep(1000);
+    }
+
+    // 3. Forcefully kill any remaining stubborn processes
+    for (const proc of processesToKill) {
+      if (proc.exitCode === null) {
+        logger.warn({ pid: proc.pid }, `Process did not terminate gracefully, forcing with SIGKILL.`);
+        try {
+          proc.removeAllListeners(); // Remove any remaining listeners (e.g., 'close')
+          proc.kill('SIGKILL');
+        } catch (e) {
+          logger.warn({ pid: proc.pid, err: e.message }, `Error sending SIGKILL to process.`);
+        }
+      }
+      // Clean up state tracking
+      CRAWL_STATE.activeDownloadProcesses.delete(proc);
+    }
   }
 
   // 2. Wait for any remaining video downloads to complete.
@@ -2132,6 +2433,12 @@ async function performShutdown(reason, exitCode = 0) {
       logger.info("All background downloads complete.");
     } catch (error) {
       logger.error({ err: error.message }, "Timeout waiting for downloads to complete. Some videos may not be saved.");
+    }
+
+    // Manually update the count since we can't rely on the 'finally' blocks anymore
+    while (CRAWL_STATE.activeVideoDownloads) {
+      CRAWL_STATE.activeVideoDownloads--;
+      await sleep(100);
     }
   }
 
