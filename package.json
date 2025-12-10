@@ -1,6 +1,6 @@
 {
   "name": "webclone",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "`webclone.js` is a Node.js script designed to archive websites and download videos.",
   "main": "webclone.js",
   "scripts": {
